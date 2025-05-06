@@ -289,3 +289,81 @@
   (- (var-get next-proposal-id) u1)
 )
 
+(define-map vote-delegates
+  { delegator: principal }
+  { 
+    delegate: principal,
+    delegated-at: uint
+  }
+)
+
+(define-public (delegate-vote-power (delegate-to principal))
+  (let
+    (
+      (delegator-info (unwrap! (map-get? members { address: tx-sender }) ERR-NOT-MEMBER))
+      (delegate-info (unwrap! (map-get? members { address: delegate-to }) ERR-NOT-MEMBER))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (get is-active delegator-info) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active delegate-info) ERR-NOT-AUTHORIZED)
+    (ok (map-set vote-delegates
+      { delegator: tx-sender }
+      {
+        delegate: delegate-to,
+        delegated-at: current-time
+      }
+    ))
+  )
+)
+
+(define-public (revoke-delegation)
+  (ok (map-delete vote-delegates { delegator: tx-sender }))
+)
+
+(define-read-only (get-delegate (delegator principal))
+  (map-get? vote-delegates { delegator: delegator })
+)
+
+
+(define-map proposal-categories
+  { category-id: uint }
+  { name: (string-ascii 50) }
+)
+
+(define-map proposal-tags
+  { proposal-id: uint }
+  { categories: (list 10 uint) }
+)
+
+(define-data-var next-category-id uint u1)
+
+(define-public (create-category (name (string-ascii 50)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (let ((category-id (var-get next-category-id)))
+      (map-set proposal-categories
+        { category-id: category-id }
+        { name: name }
+      )
+      (var-set next-category-id (+ category-id u1))
+      (ok category-id)
+    )
+  )
+)
+
+(define-public (add-proposal-categories (proposal-id uint) (categories (list 10 uint)))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-NO-SUCH-PROPOSAL))
+    )
+    (asserts! (is-eq tx-sender (get proposer proposal)) ERR-NOT-AUTHORIZED)
+    (ok (map-set proposal-tags
+      { proposal-id: proposal-id }
+      { categories: categories }
+    ))
+  )
+)
+
+(define-read-only (get-proposal-categories (proposal-id uint))
+  (map-get? proposal-tags { proposal-id: proposal-id })
+)
