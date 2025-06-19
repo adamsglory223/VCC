@@ -367,3 +367,120 @@
 (define-read-only (get-proposal-categories (proposal-id uint))
   (map-get? proposal-tags { proposal-id: proposal-id })
 )
+
+(define-constant ERR-EXECUTION-FAILED (err u111))
+(define-constant ERR-NOT-EXECUTABLE (err u112))
+(define-constant ERR-ALREADY-EXECUTED (err u113))
+(define-constant ERR-PROPOSAL-NOT-PASSED (err u114))
+
+(define-map executable-proposals
+  { proposal-id: uint }
+  {
+    action-type: (string-ascii 20),
+    target-contract: (optional principal),
+    function-name: (optional (string-ascii 50)),
+    amount: (optional uint),
+    recipient: (optional principal),
+    parameter-name: (optional (string-ascii 50)),
+    parameter-value: (optional uint),
+    is-executed: bool
+  }
+)
+
+(define-public (create-executable-proposal 
+  (title (string-ascii 100)) 
+  (description (string-utf8 500)) 
+  (duration uint) 
+  (min-voting-power uint)
+  (action-type (string-ascii 20))
+  (target-contract (optional principal))
+  (function-name (optional (string-ascii 50)))
+  (amount (optional uint))
+  (recipient (optional principal))
+  (parameter-name (optional (string-ascii 50)))
+  (parameter-value (optional uint)))
+  (let
+    (
+      (proposal-result (try! (create-proposal title description duration min-voting-power)))
+    )
+    (map-set executable-proposals
+      { proposal-id: proposal-result }
+      {
+        action-type: action-type,
+        target-contract: target-contract,
+        function-name: function-name,
+        amount: amount,
+        recipient: recipient,
+        parameter-name: parameter-name,
+        parameter-value: parameter-value,
+        is-executed: false
+      }
+    )
+    (ok proposal-result)
+  )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-NO-SUCH-PROPOSAL))
+      (executable-info (unwrap! (map-get? executable-proposals { proposal-id: proposal-id }) ERR-NOT-EXECUTABLE))
+    )
+    (asserts! (is-eq (get status proposal) "passed") ERR-PROPOSAL-NOT-PASSED)
+    (asserts! (not (get is-executed executable-info)) ERR-ALREADY-EXECUTED)
+    
+    (let ((execution-result 
+      (if (is-eq (get action-type executable-info) "transfer")
+        (execute-transfer executable-info)
+        (if (is-eq (get action-type executable-info) "parameter")
+          (execute-parameter-update executable-info)
+          ERR-EXECUTION-FAILED
+        )
+      )))
+      (match execution-result
+        success (begin
+          (map-set executable-proposals
+            { proposal-id: proposal-id }
+            (merge executable-info { is-executed: true })
+          )
+          (ok true)
+        )
+        error (err error)
+      )
+    )
+  )
+)
+
+(define-private (execute-transfer (executable-info (tuple (action-type (string-ascii 20)) (target-contract (optional principal)) (function-name (optional (string-ascii 50))) (amount (optional uint)) (recipient (optional principal)) (parameter-name (optional (string-ascii 50))) (parameter-value (optional uint)) (is-executed bool))))
+  (let
+    (
+      (transfer-amount (unwrap! (get amount executable-info) ERR-EXECUTION-FAILED))
+      (transfer-recipient (unwrap! (get recipient executable-info) ERR-EXECUTION-FAILED))
+    )
+    (as-contract (stx-transfer? transfer-amount tx-sender transfer-recipient))
+  )
+)
+
+(define-private (execute-parameter-update (executable-info (tuple (action-type (string-ascii 20)) (target-contract (optional principal)) (function-name (optional (string-ascii 50))) (amount (optional uint)) (recipient (optional principal)) (parameter-name (optional (string-ascii 50))) (parameter-value (optional uint)) (is-executed bool))))
+  (let
+    (
+      (param-name (unwrap! (get parameter-name executable-info) ERR-EXECUTION-FAILED))
+      (param-value (unwrap! (get parameter-value executable-info) ERR-EXECUTION-FAILED))
+    )
+    (if (is-eq param-name "membership-fee")
+      (ok (var-set membership-fee param-value))
+      ERR-EXECUTION-FAILED
+    )
+  )
+)
+
+(define-read-only (get-executable-proposal (proposal-id uint))
+  (map-get? executable-proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (is-proposal-executed (proposal-id uint))
+  (match (map-get? executable-proposals { proposal-id: proposal-id })
+    executable-info (get is-executed executable-info)
+    false
+  )
+)
