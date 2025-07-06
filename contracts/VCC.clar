@@ -316,6 +316,169 @@
   )
 )
 
+
+(define-constant ERR-AMENDMENT-EXISTS (err u115))
+(define-constant ERR-NO-SUCH-AMENDMENT (err u116))
+(define-constant ERR-AMENDMENT-ALREADY-APPLIED (err u117))
+(define-constant ERR-CANNOT-AMEND-FINALIZED (err u118))
+
+(define-data-var next-amendment-id uint u1)
+
+(define-map proposal-amendments
+  { amendment-id: uint }
+  {
+    proposal-id: uint,
+    new-title: (optional (string-ascii 100)),
+    new-description: (optional (string-utf8 500)),
+    new-duration: (optional uint),
+    proposer: principal,
+    created-at: uint,
+    votes-for: uint,
+    votes-against: uint,
+    status: (string-ascii 20),
+    required-approvals: uint
+  }
+)
+
+(define-map amendment-votes
+  { amendment-id: uint, voter: principal }
+  {
+    vote: (string-ascii 10),
+    voted-at: uint
+  }
+)
+
+(define-public (create-amendment 
+  (proposal-id uint) 
+  (new-title (optional (string-ascii 100))) 
+  (new-description (optional (string-utf8 500))) 
+  (new-duration (optional uint)))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-NO-SUCH-PROPOSAL))
+      (member-info (unwrap! (map-get? members { address: tx-sender }) ERR-NOT-MEMBER))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (amendment-id (var-get next-amendment-id))
+      (total-votes (+ (get yes-votes proposal) (get no-votes proposal) (get abstain-votes proposal)))
+      (required-approvals (/ total-votes u2))
+    )
+    (asserts! (get is-active member-info) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status proposal) "active") ERR-CANNOT-AMEND-FINALIZED)
+    (asserts! (< current-time (get expires-at proposal)) ERR-VOTING-CLOSED)
+    (asserts! (or (is-some new-title) (is-some new-description) (is-some new-duration)) ERR-EXECUTION-FAILED)
+    
+    (map-set proposal-amendments
+      { amendment-id: amendment-id }
+      {
+        proposal-id: proposal-id,
+        new-title: new-title,
+        new-description: new-description,
+        new-duration: new-duration,
+        proposer: tx-sender,
+        created-at: current-time,
+        votes-for: u0,
+        votes-against: u0,
+        status: "pending",
+        required-approvals: (if (> required-approvals u0) required-approvals u1)
+      }
+    )
+    
+    (var-set next-amendment-id (+ amendment-id u1))
+    (ok amendment-id)
+  )
+)
+
+(define-public (vote-on-amendment (amendment-id uint) (support bool))
+  (let
+    (
+      (amendment (unwrap! (map-get? proposal-amendments { amendment-id: amendment-id }) ERR-NO-SUCH-AMENDMENT))
+      (member-info (unwrap! (map-get? members { address: tx-sender }) ERR-NOT-MEMBER))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (vote-value (if support "for" "against"))
+      (current-votes-for (get votes-for amendment))
+      (current-votes-against (get votes-against amendment))
+    )
+    (asserts! (get is-active member-info) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status amendment) "pending") ERR-AMENDMENT-ALREADY-APPLIED)
+    (asserts! (is-none (map-get? amendment-votes { amendment-id: amendment-id, voter: tx-sender })) ERR-ALREADY-VOTED)
+    
+    (map-set amendment-votes
+      { amendment-id: amendment-id, voter: tx-sender }
+      {
+        vote: vote-value,
+        voted-at: current-time
+      }
+    )
+    
+    (let
+      (
+        (new-votes-for (if support (+ current-votes-for u1) current-votes-for))
+        (new-votes-against (if support current-votes-against (+ current-votes-against u1)))
+        (updated-amendment (merge amendment { votes-for: new-votes-for, votes-against: new-votes-against }))
+      )
+      (if (>= new-votes-for (get required-approvals amendment))
+        (begin
+          (try! (apply-amendment amendment-id))
+          (map-set proposal-amendments
+            { amendment-id: amendment-id }
+            (merge updated-amendment { status: "applied" })
+          )
+        )
+        (map-set proposal-amendments
+          { amendment-id: amendment-id }
+          updated-amendment
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-private (apply-amendment (amendment-id uint))
+  (let
+    (
+      (amendment (unwrap! (map-get? proposal-amendments { amendment-id: amendment-id }) ERR-NO-SUCH-AMENDMENT))
+      (proposal-id (get proposal-id amendment))
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-NO-SUCH-PROPOSAL))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (let
+      (
+        (updated-proposal (merge proposal {
+          title: (default-to (get title proposal) (get new-title amendment)),
+          description: (default-to (get description proposal) (get new-description amendment)),
+          expires-at: (match (get new-duration amendment)
+            new-duration (+ current-time (* new-duration u60 u60 u24))
+            (get expires-at proposal)
+          )
+        }))
+      )
+      (map-set proposals
+        { proposal-id: proposal-id }
+        updated-proposal
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-amendment (amendment-id uint))
+  (map-get? proposal-amendments { amendment-id: amendment-id })
+)
+
+(define-read-only (get-amendment-vote (amendment-id uint) (voter principal))
+  (map-get? amendment-votes { amendment-id: amendment-id, voter: voter })
+)
+
+(define-read-only (get-amendment-count)
+  (- (var-get next-amendment-id) u1)
+)
+
+(define-read-only (has-voted-on-amendment (amendment-id uint) (voter principal))
+  (is-some (map-get? amendment-votes { amendment-id: amendment-id, voter: voter }))
+)
+
 (define-public (revoke-delegation)
   (ok (map-delete vote-delegates { delegator: tx-sender }))
 )
