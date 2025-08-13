@@ -647,3 +647,268 @@
     false
   )
 )
+
+;; Proposal Sponsorship System Constants
+(define-constant ERR-INSUFFICIENT-SPONSORSHIP (err u119))
+(define-constant ERR-SPONSORSHIP-CLOSED (err u120))
+(define-constant ERR-NOT-SPONSOR (err u121))
+(define-constant ERR-REWARDS-CLAIMED (err u122))
+(define-constant ERR-PROPOSAL-NOT-FINALIZED (err u123))
+
+;; Sponsorship data variables
+(define-data-var min-sponsorship-amount uint u50) ;; Minimum STX to sponsor
+(define-data-var sponsor-reward-percentage uint u5) ;; 5% bonus for sponsors of passed proposals
+
+;; Proposal sponsorship tracking
+(define-map proposal-sponsorships
+  { proposal-id: uint }
+  {
+    total-sponsored: uint,
+    sponsor-count: uint,
+    rewards-distributed: bool,
+    target-amount: uint
+  }
+)
+
+;; Individual sponsor contributions
+(define-map sponsor-contributions
+  { proposal-id: uint, sponsor: principal }
+  {
+    amount: uint,
+    sponsored-at: uint,
+    rewards-claimed: bool
+  }
+)
+
+;; Sponsor reward pool tracking
+(define-map sponsor-rewards
+  { proposal-id: uint }
+  {
+    total-pool: uint,
+    per-token-reward: uint
+  }
+)
+
+;; Create sponsored proposal with funding target
+(define-public (create-sponsored-proposal 
+  (title (string-ascii 100)) 
+  (description (string-utf8 500)) 
+  (duration uint) 
+  (min-voting-power uint)
+  (funding-target uint)
+  (initial-sponsorship uint))
+  (let
+    (
+      (proposal-result (try! (create-proposal title description duration min-voting-power)))
+      (member-info (unwrap! (map-get? members { address: tx-sender }) ERR-NOT-MEMBER))
+    )
+    ;; Validate minimum sponsorship
+    (asserts! (>= initial-sponsorship (var-get min-sponsorship-amount)) ERR-INSUFFICIENT-SPONSORSHIP)
+    (asserts! (>= funding-target initial-sponsorship) ERR-INSUFFICIENT-SPONSORSHIP)
+    
+    ;; Transfer initial sponsorship to contract
+    (try! (stx-transfer? initial-sponsorship tx-sender (as-contract tx-sender)))
+    
+    ;; Initialize proposal sponsorship data
+    (map-set proposal-sponsorships
+      { proposal-id: proposal-result }
+      {
+        total-sponsored: initial-sponsorship,
+        sponsor-count: u1,
+        rewards-distributed: false,
+        target-amount: funding-target
+      }
+    )
+    
+    ;; Record sponsor contribution
+    (map-set sponsor-contributions
+      { proposal-id: proposal-result, sponsor: tx-sender }
+      {
+        amount: initial-sponsorship,
+        sponsored-at: (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))),
+        rewards-claimed: false
+      }
+    )
+    
+    (ok proposal-result)
+  )
+)
+
+;; Sponsor an existing proposal
+(define-public (sponsor-proposal (proposal-id uint) (amount uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-NO-SUCH-PROPOSAL))
+      (sponsorship-info (unwrap! (map-get? proposal-sponsorships { proposal-id: proposal-id }) ERR-INSUFFICIENT-SPONSORSHIP))
+      (member-info (unwrap! (map-get? members { address: tx-sender }) ERR-NOT-MEMBER))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (existing-contribution (map-get? sponsor-contributions { proposal-id: proposal-id, sponsor: tx-sender }))
+    )
+    ;; Validate sponsorship conditions
+    (asserts! (>= amount (var-get min-sponsorship-amount)) ERR-INSUFFICIENT-SPONSORSHIP)
+    (asserts! (is-eq (get status proposal) "active") ERR-SPONSORSHIP-CLOSED)
+    (asserts! (< current-time (get expires-at proposal)) ERR-VOTING-CLOSED)
+    (asserts! (get is-active member-info) ERR-NOT-AUTHORIZED)
+    
+    ;; Transfer sponsorship amount to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Update or create sponsor contribution
+    (match existing-contribution
+      contribution (map-set sponsor-contributions
+        { proposal-id: proposal-id, sponsor: tx-sender }
+        {
+          amount: (+ (get amount contribution) amount),
+          sponsored-at: (get sponsored-at contribution),
+          rewards-claimed: false
+        }
+      )
+      (begin
+        (map-set sponsor-contributions
+          { proposal-id: proposal-id, sponsor: tx-sender }
+          {
+            amount: amount,
+            sponsored-at: current-time,
+            rewards-claimed: false
+          }
+        )
+        ;; Increment sponsor count for new sponsors
+        (map-set proposal-sponsorships
+          { proposal-id: proposal-id }
+          (merge sponsorship-info { sponsor-count: (+ (get sponsor-count sponsorship-info) u1) })
+        )
+      )
+    )
+    
+    ;; Update total sponsored amount
+    (map-set proposal-sponsorships
+      { proposal-id: proposal-id }
+      (merge sponsorship-info { total-sponsored: (+ (get total-sponsored sponsorship-info) amount) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Withdraw sponsorship for failed or rejected proposals
+(define-public (withdraw-sponsorship (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-NO-SUCH-PROPOSAL))
+      (contribution (unwrap! (map-get? sponsor-contributions { proposal-id: proposal-id, sponsor: tx-sender }) ERR-NOT-SPONSOR))
+      (sponsorship-info (unwrap! (map-get? proposal-sponsorships { proposal-id: proposal-id }) ERR-INSUFFICIENT-SPONSORSHIP))
+    )
+    ;; Only allow withdrawal for rejected, expired, or failed proposals
+    (asserts! (or (is-eq (get status proposal) "rejected") 
+                  (is-eq (get status proposal) "expired") 
+                  (is-eq (get status proposal) "failed")) ERR-SPONSORSHIP-CLOSED)
+    (asserts! (not (get rewards-claimed contribution)) ERR-REWARDS-CLAIMED)
+    
+    ;; Mark as withdrawn
+    (map-set sponsor-contributions
+      { proposal-id: proposal-id, sponsor: tx-sender }
+      (merge contribution { rewards-claimed: true })
+    )
+    
+    ;; Return sponsorship amount to sponsor
+    (as-contract (stx-transfer? (get amount contribution) tx-sender tx-sender))
+  )
+)
+
+;; Distribute rewards to sponsors of passed proposals
+(define-public (claim-sponsor-rewards (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-NO-SUCH-PROPOSAL))
+      (contribution (unwrap! (map-get? sponsor-contributions { proposal-id: proposal-id, sponsor: tx-sender }) ERR-NOT-SPONSOR))
+      (sponsorship-info (unwrap! (map-get? proposal-sponsorships { proposal-id: proposal-id }) ERR-INSUFFICIENT-SPONSORSHIP))
+    )
+    ;; Validate claim conditions
+    (asserts! (is-eq (get status proposal) "passed") ERR-PROPOSAL-NOT-FINALIZED)
+    (asserts! (not (get rewards-claimed contribution)) ERR-REWARDS-CLAIMED)
+    
+    ;; Calculate rewards
+    (let
+      (
+        (sponsor-amount (get amount contribution))
+        (total-sponsored (get total-sponsored sponsorship-info))
+        (reward-percentage (var-get sponsor-reward-percentage))
+        (bonus-reward (/ (* sponsor-amount reward-percentage) u100))
+        (total-return (+ sponsor-amount bonus-reward))
+      )
+      ;; Mark rewards as claimed
+      (map-set sponsor-contributions
+        { proposal-id: proposal-id, sponsor: tx-sender }
+        (merge contribution { rewards-claimed: true })
+      )
+      
+      ;; Transfer original sponsorship plus bonus
+      (as-contract (stx-transfer? total-return tx-sender tx-sender))
+    )
+  )
+)
+
+;; Admin function to update minimum sponsorship amount
+(define-public (update-min-sponsorship (new-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (ok (var-set min-sponsorship-amount new-amount))
+  )
+)
+
+;; Admin function to update sponsor reward percentage
+(define-public (update-sponsor-reward-percentage (new-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-percentage u20) ERR-EXECUTION-FAILED) ;; Max 20% reward
+    (ok (var-set sponsor-reward-percentage new-percentage))
+  )
+)
+
+;; Read-only functions for sponsorship data
+
+;; Get proposal sponsorship details
+(define-read-only (get-proposal-sponsorship (proposal-id uint))
+  (map-get? proposal-sponsorships { proposal-id: proposal-id })
+)
+
+;; Get individual sponsor contribution
+(define-read-only (get-sponsor-contribution (proposal-id uint) (sponsor principal))
+  (map-get? sponsor-contributions { proposal-id: proposal-id, sponsor: sponsor })
+)
+
+;; Check if sponsorship target is met
+(define-read-only (is-sponsorship-target-met (proposal-id uint))
+  (match (map-get? proposal-sponsorships { proposal-id: proposal-id })
+    sponsorship-info (>= (get total-sponsored sponsorship-info) (get target-amount sponsorship-info))
+    false
+  )
+)
+
+;; Get current minimum sponsorship amount
+(define-read-only (get-min-sponsorship-amount)
+  (var-get min-sponsorship-amount)
+)
+
+;; Get current sponsor reward percentage
+(define-read-only (get-sponsor-reward-percentage)
+  (var-get sponsor-reward-percentage)
+)
+
+;; Calculate potential rewards for a sponsor
+(define-read-only (calculate-sponsor-rewards (proposal-id uint) (sponsor principal))
+  (match (map-get? sponsor-contributions { proposal-id: proposal-id, sponsor: sponsor })
+    contribution (let
+      (
+        (sponsor-amount (get amount contribution))
+        (reward-percentage (var-get sponsor-reward-percentage))
+        (bonus-reward (/ (* sponsor-amount reward-percentage) u100))
+      )
+      (ok (+ sponsor-amount bonus-reward))
+    )
+    ERR-NOT-SPONSOR
+  )
+)
+
+
+
