@@ -1,0 +1,23 @@
+[project]
+name = 'VCC'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.VCC]
+path = 'contracts/VCC.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.member-reputation-system]
+path = 'contracts/member-reputation-system.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
